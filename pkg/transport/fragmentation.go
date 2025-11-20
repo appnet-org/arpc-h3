@@ -5,7 +5,7 @@ import (
 	"sync"
 
 	"github.com/appnet-org/arpc/pkg/logging"
-	protocol "github.com/appnet-org/arpc-quic/pkg/packet"
+	protocol "github.com/appnet-org/arpc-h3/pkg/packet"
 	"go.uber.org/zap"
 )
 
@@ -65,9 +65,9 @@ func (r *DataReassembler) FragmentData(data []byte, rpcID uint64, packetTypeID p
 		})
 		return packets, nil
 	}
-	// Calculate chunk size by subtracting header overhead from max QUIC payload
-	// New header size: 1+8+2+2+4+2+4+2+4 = 29 bytes
-	chunkSize := protocol.MaxQUICPayloadSize - 29
+	// Calculate chunk size by subtracting header overhead from max payload
+	// Header size: 1+8+2+2+4+2+4+2+4 = 29 bytes
+	chunkSize := protocol.MaxH3PayloadSize - 29
 	totalPackets := uint16((len(data) + chunkSize - 1) / chunkSize)
 	var packets []any
 

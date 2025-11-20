@@ -124,7 +124,7 @@ func (c *ErrorPacketCodec) Serialize(packet any) ([]byte, error) {
 	}
 
 	msgBytes := []byte(p.ErrorMsg)
-	if len(msgBytes) > MaxQUICPayloadSize-13 { // 1+8+4 header = 13B
+	if len(msgBytes) > MaxH3PayloadSize-13 { // 1+8+4 header = 13B
 		return nil, errors.New("error message too long")
 	}
 

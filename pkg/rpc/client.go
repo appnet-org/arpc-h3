@@ -6,24 +6,24 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/appnet-org/arpc-quic/pkg/logging"
-	"github.com/appnet-org/arpc-quic/pkg/packet"
-	"github.com/appnet-org/arpc-quic/pkg/serializer"
-	"github.com/appnet-org/arpc-quic/pkg/transport"
+	"github.com/appnet-org/arpc-h3/pkg/logging"
+	"github.com/appnet-org/arpc-h3/pkg/packet"
+	"github.com/appnet-org/arpc-h3/pkg/serializer"
+	"github.com/appnet-org/arpc-h3/pkg/transport"
 	"go.uber.org/zap"
 )
 
 // Client represents an RPC client with a transport and serializer.
 type Client struct {
-	transport   *transport.QUICTransport
+	transport   *transport.HTTP3Transport
 	serializer  serializer.Serializer
 	defaultAddr string
 }
 
 // NewClient creates a new Client using the given serializer and target address.
-// The client will create a QUIC connection to the server.
+// The client will create an HTTP/3 connection to the server.
 func NewClient(serializer serializer.Serializer, addr string) (*Client, error) {
-	t, err := transport.NewQUICClientTransport()
+	t, err := transport.NewHTTP3ClientTransport()
 	if err != nil {
 		return nil, err
 	}
@@ -35,16 +35,15 @@ func NewClient(serializer serializer.Serializer, addr string) (*Client, error) {
 }
 
 // NewClientWithLocalAddr creates a new Client using the given serializer, target address, and local address.
-// Note: For QUIC, the local address is not used in the same way as UDP.
-// This function is kept for API compatibility but the localAddr parameter is ignored.
+// Note: For HTTP/3, the local address parameter is ignored for API compatibility.
 func NewClientWithLocalAddr(serializer serializer.Serializer, addr, localAddr string) (*Client, error) {
-	// For QUIC, we don't bind to a local address in the same way
+	// For HTTP/3, we don't bind to a local address in the same way
 	// The OS will assign a local port when we connect
 	return NewClient(serializer, addr)
 }
 
-// Transport returns the underlying QUIC transport for cleanup purposes
-func (c *Client) Transport() *transport.QUICTransport {
+// Transport returns the underlying HTTP/3 transport for cleanup purposes
+func (c *Client) Transport() *transport.HTTP3Transport {
 	return c.transport
 }
 
@@ -152,13 +151,13 @@ func (c *Client) Call(ctx context.Context, service, method string, req any, resp
 
 	// Wait and process the response
 	for {
-		data, _, respID, packetTypeID, err := c.transport.Receive(packet.MaxQUICPayloadSize)
+		data, _, respID, packetTypeID, err := c.transport.Receive(packet.MaxH3PayloadSize)
 		if err != nil {
 			return fmt.Errorf("failed to receive response: %w", err)
 		}
 
 		if data == nil {
-			continue // Either still waiting for fragments or we received an non-data/error packet
+			continue // Either still waiting for fragments or we received a non-data/error packet
 		}
 
 		if respID != rpcReqID {
@@ -182,6 +181,6 @@ func (c *Client) Call(ctx context.Context, service, method string, req any, resp
 }
 
 // GetTransport returns the underlying transport for advanced operations
-func (c *Client) GetTransport() *transport.QUICTransport {
+func (c *Client) GetTransport() *transport.HTTP3Transport {
 	return c.transport
 }

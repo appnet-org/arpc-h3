@@ -10,10 +10,10 @@ import (
 	"strconv"
 	"strings"
 
-	kv "github.com/appnet-org/arpc-quic/benchmark/kv-store/symphony"
-	"github.com/appnet-org/arpc-quic/pkg/logging"
-	"github.com/appnet-org/arpc-quic/pkg/rpc"
-	"github.com/appnet-org/arpc-quic/pkg/serializer"
+	kv "github.com/appnet-org/arpc-h3/benchmark/kv-store/symphony"
+	"github.com/appnet-org/arpc-h3/pkg/logging"
+	"github.com/appnet-org/arpc-h3/pkg/rpc"
+	"github.com/appnet-org/arpc-h3/pkg/serializer"
 	"go.uber.org/zap"
 )
 

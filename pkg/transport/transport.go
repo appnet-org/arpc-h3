@@ -1,7 +1,7 @@
 package transport
 
 import (
-	"context"
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -13,13 +13,14 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
-	"github.com/appnet-org/arpc-quic/pkg/packet"
-	"github.com/appnet-org/arpc-quic/pkg/transport/balancer"
+	"github.com/appnet-org/arpc-h3/pkg/packet"
+	"github.com/appnet-org/arpc-h3/pkg/transport/balancer"
 	"github.com/appnet-org/arpc/pkg/logging"
-	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"go.uber.org/zap"
 )
 
@@ -28,157 +29,124 @@ func GenerateRPCID() uint64 {
 	return uint64(time.Now().UnixNano())
 }
 
-type QUICTransport struct {
-	listener    *quic.Listener
-	conn        quic.Connection
-	connMutex   sync.Mutex
-	reassembler *DataReassembler
-	resolver    *balancer.Resolver
-	isServer    bool
+type HTTP3Transport struct {
+	server       *http3.Server
+	client       *http.Client
+	handler      http.Handler
+	address      string
+	reassembler  *DataReassembler
+	resolver     *balancer.Resolver
+	isServer     bool
+	handlerMutex sync.RWMutex
+	streams      map[uint64]*streamContext
+	streamMutex  sync.RWMutex
 }
 
-func NewQUICTransport(address string) (*QUICTransport, error) {
-	return NewQUICTransportWithBalancer(address, balancer.DefaultResolver())
+type streamContext struct {
+	dataChan   chan []byte
+	addr       *net.UDPAddr
+	rpcID      uint64
+	packetType packet.PacketTypeID
+	errChan    chan error
 }
 
-// NewQUICTransportWithBalancer creates a new QUIC transport with a custom balancer
-func NewQUICTransportWithBalancer(address string, resolver *balancer.Resolver) (*QUICTransport, error) {
-	udpAddr, err := net.ResolveUDPAddr("udp", address)
-	if err != nil {
-		return nil, err
-	}
+func NewHTTP3Transport(address string) (*HTTP3Transport, error) {
+	return NewHTTP3TransportWithBalancer(address, balancer.DefaultResolver())
+}
 
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	// Create QUIC listener
+// NewHTTP3TransportWithBalancer creates a new HTTP/3 transport with a custom balancer
+func NewHTTP3TransportWithBalancer(address string, resolver *balancer.Resolver) (*HTTP3Transport, error) {
+	// Create TLS config
 	tlsConfig, err := generateServerTLSConfig()
 	if err != nil {
 		return nil, err
 	}
-	listener, err := quic.Listen(udpConn, tlsConfig, &quic.Config{
-		MaxIdleTimeout: 30 * time.Second,
-	})
-	if err != nil {
-		return nil, err
-	}
 
-	transport := &QUICTransport{
-		listener:    listener,
-		conn:        nil,
+	transport := &HTTP3Transport{
+		address:     address,
 		reassembler: NewDataReassembler(),
 		resolver:    resolver,
 		isServer:    true,
+		streams:     make(map[uint64]*streamContext),
+	}
+
+	// Create HTTP/3 server
+	mux := http.NewServeMux()
+	transport.handler = mux
+	transport.server = &http3.Server{
+		Addr:      address,
+		Handler:   mux,
+		TLSConfig: tlsConfig,
 	}
 
 	return transport, nil
 }
 
-// NewQUICClientTransport creates a QUIC transport for client use
-func NewQUICClientTransport() (*QUICTransport, error) {
-	transport := &QUICTransport{
-		listener:    nil,
-		conn:        nil,
+// NewHTTP3ClientTransport creates an HTTP/3 transport for client use
+func NewHTTP3ClientTransport() (*HTTP3Transport, error) {
+	// Create HTTP/3 client
+	client := &http.Client{
+		Transport: &http3.RoundTripper{
+			TLSClientConfig: generateClientTLSConfig(),
+		},
+	}
+
+	transport := &HTTP3Transport{
+		client:      client,
 		reassembler: NewDataReassembler(),
 		resolver:    balancer.DefaultResolver(),
 		isServer:    false,
+		streams:     make(map[uint64]*streamContext),
 	}
 
 	return transport, nil
 }
 
-// NewQUICTransportForConnection creates a QUIC transport for a server connection
-// This is used to create a transport instance for each client connection
-func NewQUICTransportForConnection(conn quic.Connection, resolver *balancer.Resolver) *QUICTransport {
-	return &QUICTransport{
-		listener:    nil,
-		conn:        conn,
-		connMutex:   sync.Mutex{},
+// NewHTTP3TransportForStream creates an HTTP/3 transport for a server stream
+func NewHTTP3TransportForStream(resolver *balancer.Resolver) *HTTP3Transport {
+	return &HTTP3Transport{
 		reassembler: NewDataReassembler(),
 		resolver:    resolver,
 		isServer:    true,
+		streams:     make(map[uint64]*streamContext),
 	}
 }
 
-// ResolveQUICTarget resolves a QUIC address string that may be an IP, FQDN, or empty.
-// If it's empty or ":port", it binds to 0.0.0.0:<port>. For FQDNs, it uses the configured balancer
-// to select an IP from the resolved addresses.
-func ResolveQUICTarget(addr string) (*net.UDPAddr, error) {
-	// Use default resolver for backward compatibility
-	return balancer.DefaultResolver().ResolveUDPTarget(addr)
+// SetHandler sets the HTTP handler for the transport (server only)
+func (t *HTTP3Transport) SetHandler(handler http.HandlerFunc) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handler)
+	t.handlerMutex.Lock()
+	defer t.handlerMutex.Unlock()
+	t.handler = mux
+	if t.server != nil {
+		t.server.Handler = mux
+	}
 }
 
-// connect ensures we have a QUIC connection to the target address (client only)
-func (t *QUICTransport) connect(addr string) error {
-	t.connMutex.Lock()
-	defer t.connMutex.Unlock()
-
-	// If we already have a connection, check if it's still alive
-	if t.conn != nil {
-		// Check if connection context is done (connection closed)
-		select {
-		case <-t.conn.Context().Done():
-			// Connection is dead, close it
-			t.conn.CloseWithError(0, "connection check failed")
-			t.conn = nil
-		default:
-			// Connection seems alive
-			return nil
-		}
+// Send sends data over HTTP/3 (client mode)
+func (t *HTTP3Transport) Send(addr string, rpcID uint64, data []byte, packetTypeID packet.PacketTypeID) error {
+	if t.isServer {
+		return fmt.Errorf("Send not supported in server mode, use HTTP response writer directly")
 	}
 
-	// If we don't have a connection, create one
-	udpAddr, err := t.resolver.ResolveUDPTarget(addr)
-	if err != nil {
-		return err
+	// Ensure URL is properly formatted
+	if addr == "" {
+		return fmt.Errorf("address cannot be empty")
 	}
 
-	conn, err := quic.DialAddr(context.Background(), udpAddr.String(), generateClientTLSConfig(), &quic.Config{
-		MaxIdleTimeout: 30 * time.Second,
-	})
-	if err != nil {
-		return err
-	}
-	t.conn = conn
-
-	return nil
-}
-
-func (t *QUICTransport) Send(addr string, rpcID uint64, data []byte, packetTypeID packet.PacketTypeID) error {
-	// For client mode, ensure we have a connection
-	// For server mode, connection is already established
-	if !t.isServer {
-		if err := t.connect(addr); err != nil {
-			return err
-		}
+	// Add https:// prefix if not present
+	url := addr
+	if len(url) < 8 || url[:8] != "https://" {
+		url = "https://" + url
 	}
 
-	// Ensure we have a connection
-	t.connMutex.Lock()
-	conn := t.conn
-	t.connMutex.Unlock()
-	if conn == nil {
-		return fmt.Errorf("no connection available")
-	}
-
-	// Extract destination IP and port from the connection's remote address
+	// For HTTP/3, IP/Port fields are not used (HTTP handles routing)
+	// Use zero values as placeholders
 	var dstIP [4]byte
 	var dstPort uint16
-	remoteAddr := conn.RemoteAddr().(*net.UDPAddr)
-	if ip4 := remoteAddr.IP.To4(); ip4 != nil {
-		copy(dstIP[:], ip4)
-		dstPort = uint16(remoteAddr.Port)
-	}
-
-	// Get source IP and port from local address
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
 	var srcIP [4]byte
-	if ip4 := localAddr.IP.To4(); ip4 != nil {
-		copy(srcIP[:], ip4)
-	}
-	srcPort := uint16(localAddr.Port)
+	var srcPort uint16
 
 	// Fragment the data into multiple packets if needed
 	packets, err := t.reassembler.FragmentData(data, rpcID, packetTypeID, dstIP, dstPort, srcIP, srcPort)
@@ -186,18 +154,10 @@ func (t *QUICTransport) Send(addr string, rpcID uint64, data []byte, packetTypeI
 		return err
 	}
 
-	// Open a stream for sending data
-	stream, err := conn.OpenStreamSync(context.Background())
-	if err != nil {
-		return err
-	}
-	defer stream.Close()
-
-	// Iterate through each fragment and send it via the QUIC stream
+	// Serialize all packets into a single request body
+	var requestData bytes.Buffer
 	for _, pkt := range packets {
 		var packetData []byte
-
-		// Serialize based on packet type
 		switch p := pkt.(type) {
 		case *packet.DataPacket:
 			packetData, err = packet.SerializeDataPacket(p)
@@ -211,190 +171,230 @@ func (t *QUICTransport) Send(addr string, rpcID uint64, data []byte, packetTypeI
 			return fmt.Errorf("failed to serialize packet: %w", err)
 		}
 
-		logging.Debug("Serialized packet", zap.Uint64("rpcID", rpcID))
-
 		// Write packet length first (4 bytes) for framing
 		packetLen := uint32(len(packetData))
 		lenBuf := make([]byte, 4)
 		binary.LittleEndian.PutUint32(lenBuf, packetLen)
-		if _, err := stream.Write(lenBuf); err != nil {
-			return err
-		}
-
-		_, err = stream.Write(packetData)
-		logging.Debug("Sent packet", zap.Uint64("rpcID", rpcID))
-		if err != nil {
-			return err
-		}
+		requestData.Write(lenBuf)
+		requestData.Write(packetData)
 	}
+
+	// Create HTTP/3 request
+	req, err := http.NewRequest("POST", url, &requestData)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-RPC-ID", fmt.Sprintf("%d", rpcID))
+
+	// Send request
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Store response for receive
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Store response in stream context
+	t.streamMutex.Lock()
+	ctx := &streamContext{
+		dataChan:   make(chan []byte, 1),
+		addr:       nil, // Client doesn't need addr
+		rpcID:      rpcID,
+		packetType: packetTypeID,
+		errChan:    make(chan error, 1),
+	}
+	ctx.dataChan <- respBody
+	t.streams[rpcID] = ctx
+	t.streamMutex.Unlock()
 
 	return nil
 }
 
-// Receive takes a buffer size as input, read data from the QUIC stream, and return
+// Receive takes a buffer size as input, reads data from HTTP/3 responses, and returns
 // the following information when receiving the complete data for an RPC message:
 // * complete data for a message (if no message is complete, it will return nil)
 // * original source address from connection (for responses)
 // * RPC id
 // * packet type
 // * error
-func (t *QUICTransport) Receive(bufferSize int) ([]byte, *net.UDPAddr, uint64, packet.PacketTypeID, error) {
-	// For client, use the existing connection
-	var conn quic.Connection
+func (t *HTTP3Transport) Receive(bufferSize int) ([]byte, *net.UDPAddr, uint64, packet.PacketTypeID, error) {
+	// For server, we need to check if we have any completed streams
 	if t.isServer {
-		// Server should use AcceptConnection to get a connection
-		// This method is for receiving on an already accepted connection
-		if t.conn == nil {
-			return nil, nil, 0, packet.PacketTypeUnknown, fmt.Errorf("no connection available for server receive")
+		t.streamMutex.RLock()
+		for rpcID, ctx := range t.streams {
+			select {
+			case data := <-ctx.dataChan:
+				t.streamMutex.RUnlock()
+				// Process the received data
+				return t.ProcessReceivedData(data, ctx.addr, rpcID, ctx.packetType, bufferSize)
+			default:
+				// No data available for this stream, continue
+			}
 		}
-		conn = t.conn
+		t.streamMutex.RUnlock()
+		// No data available
+		return nil, nil, 0, packet.PacketTypeUnknown, nil
 	} else {
-		// Client uses the established connection
-		t.connMutex.Lock()
-		conn = t.conn
-		t.connMutex.Unlock()
-		if conn == nil {
-			return nil, nil, 0, packet.PacketTypeUnknown, fmt.Errorf("no connection established for client receive")
+		// Client: check for response data
+		t.streamMutex.RLock()
+		for rpcID, ctx := range t.streams {
+			select {
+			case data := <-ctx.dataChan:
+				t.streamMutex.RUnlock()
+				// Process the received data
+				return t.ProcessReceivedData(data, nil, rpcID, ctx.packetType, bufferSize)
+			default:
+				// No data available for this stream, continue
+			}
 		}
-	}
-
-	// Accept a stream from the connection
-	stream, err := conn.AcceptStream(context.Background())
-	if err != nil {
-		return nil, nil, 0, packet.PacketTypeUnknown, err
-	}
-	defer stream.Close()
-
-	// Read packet length first (4 bytes) for framing
-	lenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(stream, lenBuf); err != nil {
-		return nil, nil, 0, packet.PacketTypeUnknown, err
-	}
-
-	packetLen := binary.LittleEndian.Uint32(lenBuf)
-	if packetLen > uint32(bufferSize) {
-		return nil, nil, 0, packet.PacketTypeUnknown, fmt.Errorf("packet length %d exceeds buffer size %d", packetLen, bufferSize)
-	}
-
-	// Read the actual packet data
-	buffer := make([]byte, packetLen)
-	if _, err := io.ReadFull(stream, buffer); err != nil {
-		return nil, nil, 0, packet.PacketTypeUnknown, err
-	}
-
-	// Get the remote address
-	addr := conn.RemoteAddr().(*net.UDPAddr)
-
-	// Deserialize the received data
-	pkt, packetTypeID, err := packet.DeserializePacket(buffer)
-	if err != nil {
-		return nil, nil, 0, packet.PacketTypeUnknown, err
-	}
-
-	// Handle different packet types based on their nature
-	switch p := pkt.(type) {
-	case *packet.DataPacket:
-		return t.ReassembleDataPacket(p, addr, packetTypeID)
-	case *packet.ErrorPacket:
-		return []byte(p.ErrorMsg), addr, p.RPCID, packetTypeID, nil
-	default:
-		// Unknown packet type - return early with no data
-		logging.Debug("Unknown packet type", zap.Uint8("packetTypeID", uint8(packetTypeID)))
-		return nil, nil, 0, packetTypeID, nil
+		t.streamMutex.RUnlock()
+		// No data available
+		return nil, nil, 0, packet.PacketTypeUnknown, nil
 	}
 }
 
-// AcceptConnection accepts a new QUIC connection (server only)
-func (t *QUICTransport) AcceptConnection() (quic.Connection, error) {
-	if !t.isServer || t.listener == nil {
-		return nil, fmt.Errorf("AcceptConnection can only be called on a server transport")
-	}
-	return t.listener.Accept(context.Background())
-}
+// ProcessReceivedData processes received data and handles fragmentation
+func (t *HTTP3Transport) ProcessReceivedData(data []byte, addr *net.UDPAddr, rpcID uint64, packetTypeID packet.PacketTypeID, bufferSize int) ([]byte, *net.UDPAddr, uint64, packet.PacketTypeID, error) {
+	// Read packets from the data (they are framed with length prefixes)
+	offset := 0
 
-// ReassembleDataPacket processes data packets through the reassembly layer
-func (t *QUICTransport) ReassembleDataPacket(pkt *packet.DataPacket, addr *net.UDPAddr, packetTypeID packet.PacketTypeID) ([]byte, *net.UDPAddr, uint64, packet.PacketTypeID, error) {
-	// Process fragment through reassembly layer
-	fullMessage, _, reassembledRPCID, isComplete := t.reassembler.ProcessFragment(pkt, addr)
-
-	if isComplete {
-		// For responses, return the original source address from packet headers (SrcIP:SrcPort)
-		// This allows the server to send responses back to the original client
-		originalSrcAddr := &net.UDPAddr{
-			IP:   net.IP(pkt.SrcIP[:]),
-			Port: int(pkt.SrcPort),
+	for offset < len(data) {
+		if offset+4 > len(data) {
+			return nil, nil, 0, packet.PacketTypeUnknown, fmt.Errorf("data too short for packet length")
 		}
-		return fullMessage, originalSrcAddr, reassembledRPCID, packetTypeID, nil
+
+		// Read packet length
+		packetLen := binary.LittleEndian.Uint32(data[offset : offset+4])
+		offset += 4
+
+		if offset+int(packetLen) > len(data) {
+			return nil, nil, 0, packet.PacketTypeUnknown, fmt.Errorf("packet length %d exceeds remaining data", packetLen)
+		}
+
+		if packetLen > uint32(bufferSize) {
+			return nil, nil, 0, packet.PacketTypeUnknown, fmt.Errorf("packet length %d exceeds buffer size %d", packetLen, bufferSize)
+		}
+
+		// Read packet data
+		packetData := data[offset : offset+int(packetLen)]
+		offset += int(packetLen)
+
+		// Deserialize packet
+		pkt, pktType, err := packet.DeserializePacket(packetData)
+		if err != nil {
+			return nil, nil, 0, packet.PacketTypeUnknown, err
+		}
+
+		// Handle different packet types
+		switch p := pkt.(type) {
+		case *packet.DataPacket:
+			// Process fragment through reassembly layer
+			message, _, reassembledRPCID, isComplete := t.reassembler.ProcessFragment(p, addr)
+			if isComplete {
+				// Clean up stream context
+				t.streamMutex.Lock()
+				delete(t.streams, rpcID)
+				t.streamMutex.Unlock()
+				return message, addr, reassembledRPCID, pktType, nil
+			}
+			// Still waiting for more fragments, but we've processed this one
+			// Continue processing more packets
+		case *packet.ErrorPacket:
+			// Clean up stream context
+			t.streamMutex.Lock()
+			delete(t.streams, rpcID)
+			t.streamMutex.Unlock()
+			return []byte(p.ErrorMsg), addr, p.RPCID, pktType, nil
+		default:
+			logging.Debug("Unknown packet type", zap.Uint8("packetTypeID", uint8(packetTypeID)))
+			return nil, nil, 0, packetTypeID, nil
+		}
 	}
 
-	// Still waiting for more fragments
+	// If we get here, we processed packets but didn't get a complete message
 	return nil, nil, 0, packetTypeID, nil
 }
 
-// SetConnection sets the QUIC connection for this transport (used by server after accepting)
-func (t *QUICTransport) SetConnection(conn quic.Connection) {
-	t.connMutex.Lock()
-	defer t.connMutex.Unlock()
-	t.conn = conn
+// ListenAndServe starts the HTTP/3 server (server mode)
+func (t *HTTP3Transport) ListenAndServe() error {
+	if !t.isServer || t.server == nil {
+		return fmt.Errorf("ListenAndServe can only be called in server mode")
+	}
+
+	logging.Info("Starting HTTP/3 server", zap.String("addr", t.address))
+	return t.server.ListenAndServe()
 }
 
-func (t *QUICTransport) Close() error {
-	t.connMutex.Lock()
-	defer t.connMutex.Unlock()
+// Close closes the transport
+func (t *HTTP3Transport) Close() error {
+	t.streamMutex.Lock()
+	defer t.streamMutex.Unlock()
 
 	var err error
-	if t.conn != nil {
-		err = t.conn.CloseWithError(0, "transport closed")
-		t.conn = nil
+	if t.server != nil {
+		err = t.server.Close()
+		t.server = nil
 	}
 
-	if t.listener != nil {
-		listenerErr := t.listener.Close()
-		if err == nil {
-			err = listenerErr
-		}
-		t.listener = nil
+	if t.client != nil {
+		t.client.CloseIdleConnections()
+		t.client = nil
 	}
+
+	// Close all streams
+	for _, ctx := range t.streams {
+		close(ctx.dataChan)
+		close(ctx.errChan)
+	}
+	t.streams = make(map[uint64]*streamContext)
 
 	return err
 }
 
-// GetConn returns the underlying QUIC connection for direct packet sending
-func (t *QUICTransport) GetConn() quic.Connection {
-	t.connMutex.Lock()
-	defer t.connMutex.Unlock()
-	return t.conn
-}
-
-// LocalAddr returns the local UDP address of the transport
-func (t *QUICTransport) LocalAddr() *net.UDPAddr {
-	if t.listener != nil {
-		return t.listener.Addr().(*net.UDPAddr)
-	}
-	t.connMutex.Lock()
-	defer t.connMutex.Unlock()
-	if t.conn != nil {
-		return t.conn.LocalAddr().(*net.UDPAddr)
+// LocalAddr returns the local address of the transport
+func (t *HTTP3Transport) LocalAddr() *net.UDPAddr {
+	if t.server != nil {
+		addr, err := net.ResolveUDPAddr("udp", t.address)
+		if err != nil {
+			return nil
+		}
+		return addr
 	}
 	return nil
 }
 
 // GetResolver returns the resolver for this transport
-func (t *QUICTransport) GetResolver() *balancer.Resolver {
+func (t *HTTP3Transport) GetResolver() *balancer.Resolver {
 	return t.resolver
 }
 
-// generateClientTLSConfig generates a basic TLS config for QUIC
-// In production, you should use proper certificates
+// GetClient returns the HTTP client for this transport (client mode)
+func (t *HTTP3Transport) GetClient() *http.Client {
+	return t.client
+}
+
+// GetReassembler returns the data reassembler
+func (t *HTTP3Transport) GetReassembler() *DataReassembler {
+	return t.reassembler
+}
+
+// generateClientTLSConfig generates a basic TLS config for HTTP/3
 func generateClientTLSConfig() *tls.Config {
 	return &tls.Config{
 		InsecureSkipVerify: true,
-		ServerName:         "localhost",
-		NextProtos:         []string{"arpc-quic"},
+		NextProtos:         []string{"h3"},
 	}
 }
 
-// generateServerTLSConfig generates a self-signed TLS certificate for QUIC
+// generateServerTLSConfig generates a self-signed TLS certificate for HTTP/3
 func generateServerTLSConfig() (*tls.Config, error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -404,7 +404,7 @@ func generateServerTLSConfig() (*tls.Config, error) {
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject: pkix.Name{
-			Organization: []string{"ARPC-QUIC"},
+			Organization: []string{"ARPC-H3"},
 		},
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
@@ -428,6 +428,6 @@ func generateServerTLSConfig() (*tls.Config, error) {
 
 	return &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
-		NextProtos:   []string{"arpc-quic"},
+		NextProtos:   []string{"h3"},
 	}, nil
 }

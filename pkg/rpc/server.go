@@ -1,16 +1,18 @@
 package rpc
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 
-	"github.com/appnet-org/arpc-quic/pkg/packet"
-	"github.com/appnet-org/arpc-quic/pkg/transport"
-	"github.com/appnet-org/arpc/pkg/logging"
-	"github.com/appnet-org/arpc/pkg/serializer"
-	"github.com/quic-go/quic-go"
+	"github.com/appnet-org/arpc-h3/pkg/logging"
+	"github.com/appnet-org/arpc-h3/pkg/packet"
+	"github.com/appnet-org/arpc-h3/pkg/serializer"
+	"github.com/appnet-org/arpc-h3/pkg/transport"
 	"go.uber.org/zap"
 )
 
@@ -32,19 +34,19 @@ type ServiceDesc struct {
 
 // Server is the core RPC server handling transport, serialization, and registered services.
 type Server struct {
-	transport  *transport.QUICTransport
+	transport  *transport.HTTP3Transport
 	serializer serializer.Serializer
 	services   map[string]*ServiceDesc
 }
 
 // NewServer initializes a new Server instance with the given address and serializer.
 func NewServer(addr string, serializer serializer.Serializer) (*Server, error) {
-	quicTransport, err := transport.NewQUICTransport(addr)
+	http3Transport, err := transport.NewHTTP3Transport(addr)
 	if err != nil {
 		return nil, err
 	}
 	return &Server{
-		transport:  quicTransport,
+		transport:  http3Transport,
 		serializer: serializer,
 		services:   make(map[string]*ServiceDesc),
 	}, nil
@@ -57,7 +59,7 @@ func (s *Server) RegisterService(desc *ServiceDesc, impl any) {
 }
 
 // parseFramedRequest extracts service, method, and payload segments from a request frame.
-// Wire format: [dst ip(4B)][dst port(2B)][src port(2B)][serviceLen(2B)][service][methodLen(2B)][method][payload]
+// Wire format: [serviceLen(2B)][service][methodLen(2B)][method][payload]
 func (s *Server) parseFramedRequest(data []byte) (string, string, []byte, error) {
 	offset := 0
 
@@ -116,123 +118,174 @@ func (s *Server) frameResponse(service, method string, payload []byte) ([]byte, 
 
 // Start begins listening for incoming RPC requests, dispatching to the appropriate service/method handler.
 func (s *Server) Start() {
-	logging.Info("Server started... Waiting for connections.")
+	logging.Info("Server started... Waiting for HTTP/3 connections.")
 
-	for {
-		// Accept a new QUIC connection
-		conn, err := s.transport.AcceptConnection()
-		if err != nil {
-			logging.Error("Error accepting connection", zap.Error(err))
-			continue
-		}
+	s.transport.SetHandler(s.handleHTTP3Request)
 
-		logging.Info("New client connected", zap.String("addr", conn.RemoteAddr().String()))
-
-		// Handle each connection in a separate goroutine
-		go s.handleConnection(conn)
+	// Start HTTP/3 server
+	if err := s.transport.ListenAndServe(); err != nil {
+		logging.Error("Error starting HTTP/3 server", zap.Error(err))
 	}
 }
 
-// handleConnection handles a single QUIC connection
-func (s *Server) handleConnection(conn quic.Connection) {
-	defer conn.CloseWithError(0, "server closing connection")
+// handleHTTP3Request handles HTTP/3 requests
+func (s *Server) handleHTTP3Request(w http.ResponseWriter, r *http.Request) {
+	// Read request body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
 
-	// Create a transport instance for this connection
-	connTransport := transport.NewQUICTransportForConnection(conn, s.transport.GetResolver())
+	// Extract remote address
+	remoteAddr := r.RemoteAddr
+	udpAddr, err := net.ResolveUDPAddr("udp", remoteAddr)
+	if err != nil {
+		http.Error(w, "Failed to resolve remote address", http.StatusBadRequest)
+		return
+	}
 
-	for {
-		// Receive a packet from the client
-		data, addr, rpcID, _, err := connTransport.Receive(packet.MaxQUICPayloadSize)
-		if err != nil {
-			if err == io.EOF {
-				logging.Info("Client disconnected", zap.String("addr", conn.RemoteAddr().String()))
-			} else {
-				logging.Error("Error receiving data", zap.Error(err))
-			}
+	// Create a transport instance for this request to process packets
+	connTransport := transport.NewHTTP3TransportForStream(s.transport.GetResolver())
+
+	// Process the request body as packets to extract the RPC data
+	data, _, rpcID, _, err := connTransport.ProcessReceivedData(body, udpAddr, 0, packet.PacketTypeData, packet.MaxH3PayloadSize)
+	if err != nil {
+		logging.Error("Error processing request", zap.Error(err))
+		http.Error(w, "Failed to process request", http.StatusBadRequest)
+		return
+	}
+
+	if data == nil {
+		http.Error(w, "No data received", http.StatusBadRequest)
+		return
+	}
+
+	// Parse request payload
+	serviceName, methodName, reqPayloadBytes, err := s.parseFramedRequest(data)
+	if err != nil {
+		logging.Error("Failed to parse framed request", zap.Error(err))
+		// Send error response
+		s.sendErrorResponse(w, rpcID, []byte(err.Error()), packet.PacketTypeUnknown)
+		return
+	}
+
+	// Create context
+	ctx := context.Background()
+
+	// Lookup service and method
+	svcDesc, ok := s.services[serviceName]
+	if !ok {
+		logging.Warn("Unknown service", zap.String("serviceName", serviceName))
+		s.sendErrorResponse(w, rpcID, []byte("unknown service"), packet.PacketTypeError)
+		return
+	}
+	methodDesc, ok := svcDesc.Methods[methodName]
+	if !ok {
+		logging.Warn("Unknown method",
+			zap.String("serviceName", serviceName),
+			zap.String("methodName", methodName))
+		s.sendErrorResponse(w, rpcID, []byte("unknown method"), packet.PacketTypeError)
+		return
+	}
+
+	// Invoke method handler
+	resp, err := methodDesc.Handler(svcDesc.ServiceImpl, ctx, func(v any) error {
+		return s.serializer.Unmarshal(reqPayloadBytes, v)
+	})
+	if err != nil {
+		var errType packet.PacketTypeID
+		if rpcErr, ok := err.(*RPCError); ok && rpcErr.Type == RPCFailError {
+			errType = packet.PacketTypeError
+		} else {
+			errType = packet.PacketTypeUnknown
+			logging.Error("Handler error", zap.Error(err))
+		}
+		s.sendErrorResponse(w, rpcID, []byte(err.Error()), errType)
+		return
+	}
+
+	// Serialize response
+	respPayloadBytes, err := s.serializer.Marshal(resp)
+	if err != nil {
+		logging.Error("Error marshaling response", zap.Error(err))
+		s.sendErrorResponse(w, rpcID, []byte(err.Error()), packet.PacketTypeUnknown)
+		return
+	}
+
+	// Frame response
+	framedResp, err := s.frameResponse(serviceName, methodName, respPayloadBytes)
+	if err != nil {
+		logging.Error("Failed to frame response", zap.Error(err))
+		s.sendErrorResponse(w, rpcID, []byte(err.Error()), packet.PacketTypeUnknown)
+		return
+	}
+
+	// Send the response via HTTP/3
+	s.sendResponse(w, rpcID, framedResp, packet.PacketTypeData)
+}
+
+// sendResponse sends a response through HTTP/3
+func (s *Server) sendResponse(w http.ResponseWriter, rpcID uint64, data []byte, packetTypeID packet.PacketTypeID) {
+	// Use the transport to format the response data as packets
+	// Extract destination info (not used in HTTP/3 but needed for packet format)
+	var dstIP [4]byte
+	var dstPort uint16
+	var srcIP [4]byte
+	var srcPort uint16
+
+	// Create a reassembler for fragmenting the response
+	reassembler := transport.NewDataReassembler()
+
+	// Fragment the data into packets
+	packets, err := reassembler.FragmentData(data, rpcID, packetTypeID, dstIP, dstPort, srcIP, srcPort)
+	if err != nil {
+		logging.Error("Error fragmenting response", zap.Error(err))
+		http.Error(w, "Error fragmenting response", http.StatusInternalServerError)
+		return
+	}
+
+	// Serialize all packets into response body
+	var responseData bytes.Buffer
+	for _, pkt := range packets {
+		var packetData []byte
+		switch p := pkt.(type) {
+		case *packet.DataPacket:
+			packetData, err = packet.SerializeDataPacket(p)
+		case *packet.ErrorPacket:
+			packetData, err = packet.SerializeErrorPacket(p)
+		default:
+			http.Error(w, "Unknown packet type", http.StatusInternalServerError)
 			return
 		}
 
-		if data == nil {
-			continue // Either still waiting for fragments or we received an non-data packet
-		}
-
-		// Parse request payload
-		serviceName, methodName, reqPayloadBytes, err := s.parseFramedRequest(data)
 		if err != nil {
-			logging.Error("Failed to parse framed request", zap.Error(err))
-			if err := connTransport.Send(addr.String(), rpcID, []byte(err.Error()), packet.PacketTypeUnknown); err != nil {
-				logging.Error("Error sending error response", zap.Error(err))
-			}
-			continue
+			logging.Error("Error serializing packet", zap.Error(err))
+			http.Error(w, "Error serializing packet", http.StatusInternalServerError)
+			return
 		}
 
-		// Create context
-		ctx := context.Background()
-
-		// Lookup service and method
-		svcDesc, ok := s.services[serviceName]
-		if !ok {
-			logging.Warn("Unknown service", zap.String("serviceName", serviceName))
-			if err := connTransport.Send(addr.String(), rpcID, []byte("unknown service"), packet.PacketTypeError); err != nil {
-				logging.Error("Error sending error response", zap.Error(err))
-			}
-			continue
-		}
-		methodDesc, ok := svcDesc.Methods[methodName]
-		if !ok {
-			logging.Warn("Unknown method",
-				zap.String("serviceName", serviceName),
-				zap.String("methodName", methodName))
-			continue
-		}
-
-		// Invoke method handler
-		resp, err := methodDesc.Handler(svcDesc.ServiceImpl, ctx, func(v any) error {
-			return s.serializer.Unmarshal(reqPayloadBytes, v)
-		})
-		if err != nil {
-			var errType packet.PacketTypeID
-			if rpcErr, ok := err.(*RPCError); ok && rpcErr.Type == RPCFailError {
-				errType = packet.PacketTypeError
-			} else {
-				errType = packet.PacketTypeUnknown
-				logging.Error("Handler error", zap.Error(err))
-			}
-			if err := connTransport.Send(addr.String(), rpcID, []byte(err.Error()), errType); err != nil {
-				logging.Error("Error sending error response", zap.Error(err))
-			}
-			continue
-		}
-
-		// Serialize response
-		respPayloadBytes, err := s.serializer.Marshal(resp)
-		if err != nil {
-			logging.Error("Error marshaling response", zap.Error(err))
-			if err := connTransport.Send(addr.String(), rpcID, []byte(err.Error()), packet.PacketTypeUnknown); err != nil {
-				logging.Error("Error sending error response", zap.Error(err))
-			}
-			continue
-		}
-
-		// Frame response
-		framedResp, err := s.frameResponse(serviceName, methodName, respPayloadBytes)
-		if err != nil {
-			logging.Error("Failed to frame response", zap.Error(err))
-			if err := connTransport.Send(addr.String(), rpcID, []byte(err.Error()), packet.PacketTypeUnknown); err != nil {
-				logging.Error("Error sending error response", zap.Error(err))
-			}
-			continue
-		}
-
-		// Send the response
-		err = connTransport.Send(addr.String(), rpcID, framedResp, packet.PacketTypeData)
-		if err != nil {
-			logging.Error("Error sending response", zap.Error(err))
-		}
+		// Write packet length first (4 bytes) for framing
+		packetLen := uint32(len(packetData))
+		lenBuf := make([]byte, 4)
+		binary.LittleEndian.PutUint32(lenBuf, packetLen)
+		responseData.Write(lenBuf)
+		responseData.Write(packetData)
 	}
+
+	// Send response
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	w.Write(responseData.Bytes())
+}
+
+// sendErrorResponse sends an error response through HTTP/3
+func (s *Server) sendErrorResponse(w http.ResponseWriter, rpcID uint64, errMsg []byte, errType packet.PacketTypeID) {
+	s.sendResponse(w, rpcID, errMsg, errType)
 }
 
 // GetTransport returns the underlying transport for advanced operations
-func (s *Server) GetTransport() *transport.QUICTransport {
+func (s *Server) GetTransport() *transport.HTTP3Transport {
 	return s.transport
 }

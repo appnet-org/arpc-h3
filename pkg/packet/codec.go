@@ -6,7 +6,8 @@ import (
 
 const MaxUDPPayloadSize = 1400   // Adjust based on MTU considerations (deprecated, kept for compatibility)
 const MaxTCPPayloadSize = 65535  // TCP can handle larger payloads, but we use a reasonable default (deprecated, kept for compatibility)
-const MaxQUICPayloadSize = 65535 // QUIC can handle larger payloads, similar to TCP
+const MaxQUICPayloadSize = 65535 // QUIC can handle larger payloads, similar to TCP (deprecated)
+const MaxH3PayloadSize = 1048576 // HTTP/3 can handle larger payloads (1MB default)
 
 // PacketCodec is the base interface that all codecs must implement
 type PacketCodec interface {
